@@ -426,7 +426,7 @@ def pairwise_reward_model_inf(url, input_ids, retries_left=5):
         'input_ids': input_ids,
     }]
 
-    api_key = "gLV5M8.MzsGx./9w5bieuX0bI3DeRS37C_Tnk40ux7d0KKX"
+    api_key = ""
     headers = {"Authorization": api_key,
                "Content-Type": "application/json"}
 
