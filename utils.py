@@ -128,6 +128,39 @@ def chat_completion_openai(model, messages, temperature, max_tokens, api_dict=No
     return output
 
 
+def chat_completion_bpt(batch_prompts, max_tokens, temperature, stop, api_args, retries_left=5):
+    import openai
+    # We should get a URL from the yaml's generate_config
+    assert api_args['api_base'] is not None, "Error: Generate URL inference not found in YAML's generate_config"
+    # print(f"Generate url: {url} and api_key: {api_key}")
+    
+    client = openai.OpenAI(
+        api_key=api_args['api_key'],
+        base_url=api_args['api_base'],
+        max_retries=retries_left
+    )
+    
+    max_retries = retries_left + 1
+    sleep_time = 5
+    while retries_left > 0:
+        try:
+            out = client.completions.create(
+                prompt=batch_prompts,
+                model=api_args['model'],
+                temperature=temperature,
+                max_tokens=1024,
+                stop=stop
+            )
+            responses = [choice.text for choice in out.choices]
+            return responses
+        except Exception as e:
+            print(f"BATCH GENERATE ERROR: {e}")
+            # change to multiplicative backoff
+            time.sleep(sleep_time * (max_retries - retries_left))
+            retries_left -= 1
+    raise Exception("Too many retries on BPT generate")
+
+
 def chat_completion_openai_azure(model, messages, temperature, max_tokens, api_dict=None):
     import openai
     from openai import AzureOpenAI
@@ -320,6 +353,268 @@ def chat_completion_cohere(model, messages, temperature, max_tokens):
     
     return output
 
+def bpt_inference_deployment_dbrx(
+    tokenizer,
+    messages,
+    temperature,
+    max_tokens,
+    api_args,
+    reward_model_addr=None,
+    num_rm_samples=1,
+    rm_tokenizer=None,
+):
+    # RM formatting: BPT accepts string inputs
+    def format_messages_for_reward(messages, responses, tokenizer):
+        messages.append({'role': 'assistant', 'content': responses})
+        # NOTE apply chat template auto adds eos
+        rm_input = tokenizer.apply_chat_template(messages, tokenize=False)
+        messages.pop()
+        return rm_input
+
+    def query_rm(rm_query: str):
+        response = requests.post(f"{reward_model_addr}/reward",
+                                 json={
+                                    "prompt": rm_query,
+                                 })
+        response.raise_for_status()
+        out = response.json()
+        return out['score'][0][0]
+
+    # Make sure we have a reward model tokenizer if doing reward inference
+    if reward_model_addr is not None:
+        assert rm_tokenizer is not None
+
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    stop = tokenizer.eos_token
+    orig_len = len(messages)
+
+    chosen_reward_score = None
+    samples = []
+    
+    # NOTE: Best of N loop: N=num_rm_samples
+    for i in range(num_rm_samples):
+        # Get response from model
+        responses = chat_completion_bpt(
+            [prompt],
+            max_tokens,
+            temperature,
+            stop,
+            api_args,
+            retries_left=5,
+        )[0]
+        if reward_model_addr is not None:
+            rm_query = format_messages_for_reward(messages, responses, rm_tokenizer)
+            score = query_rm(rm_query)
+            samples.append((responses, score))
+        else:
+            samples.append((responses, 0))
+    
+    # Get the highest scored sample
+    samples = sorted(samples, key = lambda x: x[1])
+    output = samples[-1][0]
+    chosen_reward_score = samples[-1][1]
+
+    return output, chosen_reward_score
+
+
+def pairwise_reward_model_inf(url, input_ids, retries_left=5):
+    custom_input = [{
+        'input_ids': input_ids,
+    }]
+
+    api_key = "gLV5M8.MzsGx./9w5bieuX0bI3DeRS37C_Tnk40ux7d0KKX"
+    headers = {"Authorization": api_key,
+               "Content-Type": "application/json"}
+
+    request = {'custom_input': custom_input, 'prompt': ''}
+    inf_data = json.dumps(request)
+
+    response = requests.post(f'{url}',
+                                headers=headers,
+                                data=inf_data,
+                                timeout=360)
+    if response.status_code == 400 and 'Please reduce the length of your prompt.' in response.text:
+        return None
+    elif response.status_code != 200:
+        if retries_left > 0:
+            print("Retrying...", response.status_code)
+            # sleep for longer each retry
+            time.sleep(5 * (6 - retries_left))
+            return pairwise_reward_model_inf(url, input_ids, retries_left=retries_left - 1)
+        else:
+            raise Exception('Too many retries')
+    else:
+        response = response.json()
+        # print("REWARD CALL", response)
+
+        final_rewards = []
+        for choice in response['choices']:
+            final_reward = choice['metadata']['rewards'][-1]
+            final_rewards.append(final_reward)
+        return final_rewards
+
+def bpt_inference_dbrx_deployment(
+    tokenizer,
+    messages,
+    temperature,
+    max_tokens,
+    api_args,
+    reward_model_addr=None,
+    num_rm_samples=1,
+    rm_tokenizer=None,
+):
+    def format_messages_for_reward(messages, responses, tokenizer):
+        messages.append({'role': 'assistant', 'content': responses})
+        rm_input = tokenizer.apply_chat_template(messages, tokenize = True) + [tokenizer.eos_token_id]
+        messages.pop()
+        return rm_input
+
+    def query_rm(input_ids, retries_left=5):
+        custom_input = [{
+            'input_ids': input_ids,
+        }]
+
+        api_key = ""
+        headers = {"Authorization": api_key,
+                "Content-Type": "application/json"}
+
+        request = {'custom_input': custom_input, 'prompt': ''}
+        inf_data = json.dumps(request)
+
+        response = requests.post(f'{reward_model_addr}',
+                                    headers=headers,
+                                    data=inf_data,
+                                    timeout=360)
+        if response.status_code == 400 and 'Please reduce the length of your prompt.' in response.text:
+            return None
+        elif response.status_code != 200:
+            if retries_left > 0:
+                print("Retrying...", response.status_code)
+                # sleep for longer each retry
+                time.sleep(5 * (6 - retries_left))
+                return pairwise_reward_model_inf(url, input_ids, retries_left=retries_left - 1)
+            else:
+                raise Exception('Too many retries')
+        else:
+            response = response.json()
+            # print("REWARD CALL", response)
+
+            final_rewards = []
+            for choice in response['choices']:
+                final_reward = choice['metadata']['rewards'][-1]
+                final_rewards.append(final_reward)
+            return final_rewards
+
+    # Make sure we have a reward model tokenizer if doing reward inference
+    if reward_model_addr is not None:
+        assert rm_tokenizer is not None
+
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    stop = tokenizer.eos_token
+    #orig_len = len(messages)
+
+    chosen_reward_score = None
+    samples = []
+    
+    # NOTE: Best of N loop: N=num_rm_samples
+    for _ in range(num_rm_samples):
+        # Get response from model
+        responses = chat_completion_bpt(
+            [prompt],
+            max_tokens,
+            temperature,
+            stop,
+            api_args,
+            retries_left=5,
+        )[0]
+        if reward_model_addr is not None:
+            rm_query = format_messages_for_reward(messages, responses, rm_tokenizer)
+            score = query_rm(rm_query)
+            samples.append((responses, score))
+        else:
+            samples.append((responses, 0))
+    
+    # Get the highest scored sample
+    samples = sorted(samples, key = lambda x: x[1])
+    output = samples[-1][0]
+    chosen_reward_score = samples[-1][1]
+
+    return output, chosen_reward_score
+
+def bpt_inference_deployment(
+    tokenizer,
+    messages,
+    temperature,
+    max_tokens,
+    api_args,
+    reward_model_addr=None,
+    num_rm_samples=1,
+    rm_tokenizer=None,
+):
+    # RM formatting: BPT accepts string inputs
+    def format_messages_for_reward(messages, responses, tokenizer):
+        messages.append({'role': 'assistant', 'content': responses})
+        # NOTE apply chat template auto adds eos
+        rm_input = tokenizer.apply_chat_template(messages, tokenize=False)
+        messages.pop()
+        return rm_input
+
+    def query_rm(rm_query: str):
+        response = requests.post(f"{reward_model_addr}/reward",
+                                 json={
+                                    "prompt": rm_query,
+                                 })
+        response.raise_for_status()
+        out = response.json()
+        return out['score'][0][0]
+
+    # Make sure we have a reward model tokenizer if doing reward inference
+    if reward_model_addr is not None:
+        assert rm_tokenizer is not None
+
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    stop = tokenizer.eos_token
+    orig_len = len(messages)
+
+    chosen_reward_score = None
+    samples = []
+    
+    # NOTE: Best of N loop: N=num_rm_samples
+    for i in range(num_rm_samples):
+        # Get response from model
+        responses = chat_completion_bpt(
+            [prompt],
+            max_tokens,
+            temperature,
+            stop,
+            api_args,
+            retries_left=5,
+        )[0]
+        if reward_model_addr is not None:
+            rm_query = format_messages_for_reward(messages, responses, rm_tokenizer)
+            score = query_rm(rm_query)
+            samples.append((responses, score))
+        else:
+            samples.append((responses, 0))
+    
+    # Get the highest scored sample
+    samples = sorted(samples, key = lambda x: x[1])
+    output = samples[-1][0]
+    chosen_reward_score = samples[-1][1]
+
+    return output, chosen_reward_score
 
 def reorg_answer_file(answer_file):
     """Sort by question id and de-duplication"""

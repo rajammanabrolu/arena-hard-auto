@@ -20,6 +20,8 @@ from utils import (
     load_model_answers,
     make_config,
     get_endpoint,
+    bpt_inference_deployment,
+    bpt_inference_dbrx_deployment,
     chat_completion_openai,
     chat_completion_anthropic,
     chat_completion_openai_azure,
@@ -33,7 +35,16 @@ from utils import (
 
 
 def get_answer(
-    question: dict, model: str, endpoint_info: dict, num_choices: int, max_tokens: int, temperature: float, answer_file: str, api_dict: dict
+    question: dict,
+    model: str,
+    endpoint_info: dict,
+    num_choices: int,
+    max_tokens: int,
+    temperature: float,
+    answer_file: str,
+    api_dict: dict,
+    tokenizer,
+    rm_tokenizer,
 ):
     if question["category"] in temperature_config:
         temperature = temperature_config[question["category"]]
@@ -79,6 +90,30 @@ def get_answer(
                                                 messages=conv,
                                                 temperature=temperature,
                                                 max_tokens=max_tokens)
+            elif api_type == "bpt":
+                # We will be using the new BPT inference endpoint
+                output, chosen_reward_score = bpt_inference_deployment(
+                    tokenizer=tokenizer, 
+                    messages=conv, 
+                    temperature=temperature, 
+                    max_tokens=max_tokens, 
+                    api_args=api_dict,
+                    num_rm_samples=endpoint_info.get('num_rm_samples', 1),
+                    reward_model_addr=endpoint_info.get('reward_model_addr', None),
+                    rm_tokenizer=rm_tokenizer,
+                )
+            elif api_type == "bpt_dbrx":
+                # We will be using the new BPT inference endpoint
+                output, chosen_reward_score = bpt_inference_dbrx_deployment(
+                    tokenizer=tokenizer, 
+                    messages=conv, 
+                    temperature=temperature, 
+                    max_tokens=max_tokens, 
+                    api_args=api_dict,
+                    num_rm_samples=endpoint_info.get('num_rm_samples', 1),
+                    reward_model_addr=endpoint_info.get('reward_model_addr', None),
+                    rm_tokenizer=rm_tokenizer,
+                )
             else:
                 output = chat_completion_openai(model=endpoint_info["model_name"], 
                                                 messages=conv, 
@@ -144,6 +179,7 @@ if __name__ == "__main__":
             parallel = 1
 
         # We want to maximizes the number of tokens generate per answer: max_tokens = specified token # - input tokens #
+        rm_tokenizer = None
         if "tokenizer" in endpoint_info:
             question_list = [question["turns"][0]["content"] for question in questions]
             if model in OPENAI_MODEL_LIST:
@@ -155,11 +191,22 @@ if __name__ == "__main__":
                 
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
                 tokenizer = AutoTokenizer.from_pretrained(endpoint_info["tokenizer"])
+                # NOTE: don't hardcode
+                if "rm_tokenizer" in endpoint_info:
+                    rm_tokenizer = AutoTokenizer.from_pretrained(
+                        endpoint_info['rm_tokenizer'], trust_remote_code=True
+                    )
+                else:
+                    rm_tokenizer = AutoTokenizer.from_pretrained(
+                        endpoint_info["tokenizer"], pad_token="[PAD]"
+                    )
 
                 tokens = tokenizer(question_list)
                 max_tokens = [(settings["max_tokens"] - len(prompt) - 300) for prompt in tokens["input_ids"]]
         else:
+            tokenizer=None
             max_tokens = [settings["max_tokens"]] * len(questions)
+
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
             futures = []
@@ -178,6 +225,8 @@ if __name__ == "__main__":
                     settings["temperature"],
                     answer_file,
                     get_endpoint(endpoint_info["endpoints"]),
+                    tokenizer,
+                    rm_tokenizer,
                 )
                 futures.append(future)
             if count > 0:
