@@ -21,6 +21,7 @@ from utils import (
     make_config,
     get_endpoint,
     bpt_inference_deployment,
+    bpt_fg_inference_deployment,
     bpt_inference_dbrx_deployment,
     chat_completion_openai,
     chat_completion_anthropic,
@@ -93,6 +94,18 @@ def get_answer(
             elif api_type == "bpt":
                 # We will be using the new BPT inference endpoint
                 output, chosen_reward_score = bpt_inference_deployment(
+                    tokenizer=tokenizer, 
+                    messages=conv, 
+                    temperature=temperature, 
+                    max_tokens=max_tokens, 
+                    api_args=api_dict,
+                    num_rm_samples=endpoint_info.get('num_rm_samples', 1),
+                    reward_model_addr=endpoint_info.get('reward_model_addr', None),
+                    rm_tokenizer=rm_tokenizer,
+                )
+            elif api_type == "bpt_fg":
+                # We will be using the new BPT inference endpoint
+                output, chosen_reward_score = bpt_fg_inference_deployment(
                     tokenizer=tokenizer, 
                     messages=conv, 
                     temperature=temperature, 

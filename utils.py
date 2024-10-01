@@ -7,6 +7,7 @@ import requests
 
 from typing import Optional
 from glob import glob
+import spacy
 
 # API setting constants
 API_MAX_RETRY = 16
@@ -605,6 +606,135 @@ def bpt_inference_deployment(
         if reward_model_addr is not None:
             rm_query = format_messages_for_reward(messages, responses, rm_tokenizer)
             score = query_rm(rm_query)
+            samples.append((responses, score))
+        else:
+            samples.append((responses, 0))
+    
+    # Get the highest scored sample
+    samples = sorted(samples, key = lambda x: x[1])
+    output = samples[-1][0]
+    chosen_reward_score = samples[-1][1]
+
+    return output, chosen_reward_score
+
+def bpt_fg_inference_deployment(
+    tokenizer,
+    messages,
+    temperature,
+    max_tokens,
+    api_args,
+    reward_model_addr=None,
+    num_rm_samples=1,
+    rm_tokenizer=None,
+):
+    from compose_rl.utils import process_fine_granularities, scatter_gather_rewards
+    import torch
+    parser = spacy.load('en_core_web_sm')
+
+    # RM formatting: BPT accepts string inputs
+    def format_messages_for_reward(messages, responses, tokenizer):
+        messages.append({'role': 'assistant', 'content': responses})
+        # NOTE apply chat template auto adds eos
+        rm_input = tokenizer.apply_chat_template(messages, tokenize=False)
+        messages.pop()
+        return rm_input
+
+    def query_fg_rm(messages, responses, tokenizer):
+        prompt = tokenizer.apply_chat_template(messages, tokenize=False)
+        prompt_tokenized = tokenizer(prompt)
+        prompt_len = len(prompt_tokenized['input_ids'])
+        generated = tokenizer.apply_chat_template({'role': 'assistant', 'content': responses},
+                                                  tokenize=False)
+        generated_tokenized = tokenizer(generated)
+        generated_len = len(generated_tokenized['input_ids'])
+        
+        original_obs = tokenizer.apply_chat_template(
+            messages.append({'role': 'assistant', 'content': responses}),
+            tokenize=True
+        )
+        
+        seq_len = len(original_obs['input_ids'])
+        
+        granularity = 'subsentence'
+        max_seq_len = 4096
+        
+        reward_input, reward_prompt_len, reward_generated_len, reward_seq_len, \
+        end_indices_aligned_gather, end_indices_aligned_scatter = process_fine_granularities(
+            prompt,
+            prompt_len,
+            generated,
+            generated_len,
+            original_obs,
+            granularity,
+            parser,
+            tokenizer,
+            max_seq_len
+        )
+        #return reward_input, reward_prompt_len, reward_generated_len, reward_seq_len, \
+        #    end_indices_aligned_gather, end_indices_aligned_scatter
+    
+        reward_input, reward_prompt_len, reward_generated_len, reward_seq_len, \
+            end_indices_aligned_gather, end_indices_aligned_scatter = rm_query
+        response = requests.post(f"{reward_model_addr}/reward",
+                                 json={
+                                    "prompt": reward_input,
+                                 })
+        response.raise_for_status()
+        out = response.json()
+        
+        device = 'cpu'
+        batch_size = 1
+        curr_rewards = torch.FloatTensor(out['score'], device=device).view(batch_size, -1)
+        temp_rews = torch.zeros_like(curr_rewards)
+        
+        corrected_rews = scatter_gather_rewards(
+            temp_rews=temp_rews,
+            curr_rewards=curr_rewards,
+            reward_prompt_lens=torch.LongTensor(reward_prompt_len, device=device).view(batch_size, -1),
+            prompt_lens=torch.LongTensor(prompt_len, device=device).view(batch_size, -1),
+            generated_lens=torch.LongTensor(generated_len, device=device).view(batch_size, -1),
+            seq_lens=torch.LongTensor(seq_len, device=device).view(batch_size, -1),
+            reward_prompt_len=torch.LongTensor(reward_prompt_len, device=device).view(batch_size, -1),
+            reward_generated_lens=torch.LongTensor(reward_generated_len, device=device).view(batch_size, -1),
+            reward_seq_lens=torch.LongTensor(reward_seq_len, device=device).view(batch_size, -1),
+            end_idxs_gather=torch.LongTensor(end_indices_aligned_gather, device=device).view(batch_size, -1),
+            end_idxs_scatter=torch.LongTensor(end_indices_aligned_scatter, device=device).view(batch_size, -1)
+        )
+        
+        overall_score = corrected_rews.sum().item()
+        
+        return overall_score # out['score'][0][-1]
+
+    # Make sure we have a reward model tokenizer if doing reward inference
+    if reward_model_addr is not None:
+        assert rm_tokenizer is not None
+
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    stop = tokenizer.eos_token
+    orig_len = len(messages)
+
+    chosen_reward_score = None
+    samples = []
+    
+    # NOTE: Best of N loop: N=num_rm_samples
+    for i in range(num_rm_samples):
+        # Get response from model
+        responses = chat_completion_bpt(
+            [prompt],
+            max_tokens,
+            temperature,
+            stop,
+            api_args,
+            retries_left=5,
+        )[0]
+        if reward_model_addr is not None:
+            #rm_query = format_messages_for_reward(messages, responses, rm_tokenizer)
+            #score = query_rm(rm_query)
+            score = query_fg_rm(messages, responses, rm_tokenizer)
             samples.append((responses, score))
         else:
             samples.append((responses, 0))
